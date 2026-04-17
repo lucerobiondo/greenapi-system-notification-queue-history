@@ -1,5 +1,5 @@
 // ============================================================
-// app/api/worker/route.ts — POST /api/worker
+// POST /api/worker
 // ============================================================
 // Dispara el worker para procesar mensajes de la cola.
 // En producción, llamá este endpoint desde un cron job o
@@ -10,8 +10,8 @@
 //
 // Protección: verificar WORKER_SECRET en producción.
 
+import { drainQueue, runWorkerOnce } from "@/lib/worker";
 import { NextRequest, NextResponse } from "next/server";
-import { runWorkerOnce, drainQueue } from "@/lib/worker";
 
 const WORKER_SECRET = process.env.WORKER_SECRET;
 
@@ -47,7 +47,6 @@ export async function POST(req: NextRequest) {
     }
 }
 
-// GET /api/worker — health check del worker
 export async function GET() {
     return NextResponse.json({
         status: "ok",

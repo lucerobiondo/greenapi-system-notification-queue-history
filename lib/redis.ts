@@ -1,77 +1,109 @@
-// ============================================================
-// lib/redis.ts — Cliente Upstash Redis (HTTP, serverless-ready)
-// ============================================================
-// Requiere: npm install @upstash/redis
-//
-// Variables de entorno (Vercel las inyecta automáticamente si
-// conectás la integración de Upstash desde el dashboard):
-//   UPSTASH_REDIS_REST_URL
-//   UPSTASH_REDIS_REST_TOKEN
-
 import { Redis } from "@upstash/redis";
+import type { QueuedMessage } from "../types";
 
 declare global {
-    // eslint-disable-next-line no-var
     var _redis: Redis | undefined;
 }
 
-function createRedisClient(): Redis {
+function createClient(): Redis {
     const url = process.env.UPSTASH_REDIS_REST_URL;
     const token = process.env.UPSTASH_REDIS_REST_TOKEN;
-
     if (!url || !token) {
-        throw new Error(
-            "Faltan variables de entorno: UPSTASH_REDIS_REST_URL y UPSTASH_REDIS_REST_TOKEN"
-        );
+        throw new Error("Faltan variables de entorno de Upstash");
     }
-
     return new Redis({ url, token });
 }
 
-// En desarrollo reutilizamos la instancia entre hot-reloads de Next.js
 const redis: Redis =
     process.env.NODE_ENV === "development"
-        ? (globalThis._redis ?? (globalThis._redis = createRedisClient()))
-        : createRedisClient();
+        ? (globalThis._redis ?? (globalThis._redis = createClient()))
+        : createClient();
 
 export default redis;
 
+// ──────────────────────────────────────────────
 
-// // ============================================================
-// // lib/redis.ts — Cliente Redis (singleton)
-// // ============================================================
-// // Requiere: npm install ioredis
-// // Variable de entorno: REDIS_URL=redis://localhost:6379
+const QUEUE_KEY = "whatsapp:queue";
+const MSG_PREFIX = "whatsapp:msg:";
+const TTL = 7 * 86400; // 7 días
 
-// import Redis from "ioredis";
+// ──────────────────────────────────────────────
+// ENQUEUE — atómico (SET + RPUSH)
+// ──────────────────────────────────────────────
 
-// declare global {
-//     // eslint-disable-next-line no-var
-//     var _redis: Redis | undefined;
-// }
+export async function redisEnqueue(msg: QueuedMessage): Promise<void> {
+    const key = `${MSG_PREFIX}${msg.id}`;
 
-// function createRedisClient(): Redis {
-//     const url = process.env.REDIS_URL || "redis://localhost:6379";
-//     const client = new Redis(url, {
-//         maxRetriesPerRequest: 3,
-//         lazyConnect: false,
-//     });
+    const res = await redis
+        .multi()
+        .set(key, JSON.stringify(msg), { ex: TTL })
+        .rpush(QUEUE_KEY, msg.id)
+        .exec();
 
-//     client.on("error", (err) => {
-//         console.error("[Redis] Error de conexión:", err.message);
-//     });
+    console.log("ENQUEUE OK →", msg.id);
+    console.log("MULTI RESULT:", res);
+}
 
-//     client.on("connect", () => {
-//         console.log("[Redis] Conectado correctamente");
-//     });
+// ──────────────────────────────────────────────
+// DEQUEUE — robusto + limpieza de basura
+// ──────────────────────────────────────────────
 
-//     return client;
-// }
+export async function redisDequeue(): Promise<QueuedMessage | null> {
+    let attempts = 0;
+    const MAX_ATTEMPTS = 5;
 
-// // En desarrollo reutilizamos la instancia entre hot-reloads
-// const redis: Redis =
-//     process.env.NODE_ENV === "development"
-//         ? (globalThis._redis ?? (globalThis._redis = createRedisClient()))
-//         : createRedisClient();
+    while (attempts < MAX_ATTEMPTS) {
+        const id = await redis.lpop<string>(QUEUE_KEY);
 
-// export default redis;
+        if (!id) return null;
+
+        const key = `${MSG_PREFIX}${id}`;
+        const raw = await redis.get<string>(key);
+
+        if (!raw) {
+            console.warn(`⚠️ ID huérfano eliminado: ${id}`);
+            attempts++;
+            continue; // intenta con el siguiente
+        }
+
+        // borrar payload (equivalente a GETDEL pero seguro)
+        await redis.del(key);
+
+        try {
+            const parsed = typeof raw === "string" ? JSON.parse(raw) : raw;
+
+            const str = (v: unknown) => (v == null ? "" : String(v));
+
+            return {
+                ...parsed,
+                id: str(parsed.id),
+                telefono: str(parsed.telefono),
+                contenido: str(parsed.contenido),
+                status: str(parsed.status),
+                intentos: Number(parsed.intentos),
+                maxIntentos: Number(parsed.maxIntentos),
+                creadoEn: Number(parsed.creadoEn),
+                actualizadoEn: Number(parsed.actualizadoEn),
+                error: parsed.error ? str(parsed.error) : undefined,
+            };
+        } catch (e) {
+            console.error(`❌ JSON inválido para ID: ${id}, ${e}`);
+            return null;
+        }
+    }
+
+    return null;
+}
+
+// ──────────────────────────────────────────────
+// UTILS
+// ──────────────────────────────────────────────
+
+export async function redisQueueLength(): Promise<number> {
+    return redis.llen(QUEUE_KEY);
+}
+
+export async function redisClearQueue(): Promise<void> {
+    await redis.del(QUEUE_KEY);
+    console.log("🧹 Cola limpiada");
+}

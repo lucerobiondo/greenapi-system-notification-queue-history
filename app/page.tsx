@@ -42,8 +42,9 @@ const STATUS_META: Record<Status, { label: string; color: string; icon: string }
 };
 
 const PHONES_EXAMPLE = [
-  "5491198765432",
-  "5493512000001",
+  "5492612441510",
+  // "5491198765432",
+  // "5493512000001",
 ];
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
@@ -71,7 +72,6 @@ export default function Dashboard() {
   const [stats, setStats] = useState<Stats | null>(null);
   const [history, setHistory] = useState<Msg[]>([]);
   const [logs, setLogs] = useState<LogEntry[]>([]);
-  const [autoRefresh, setAutoRefresh] = useState(true);
   const [tab, setTab] = useState<"send" | "history" | "worker">("send");
   const [workerBusy, setWorkerBusy] = useState(false);
   const [filterStatus, setFilterStatus] = useState<Status | "">("");
@@ -86,23 +86,89 @@ export default function Dashboard() {
   // ── Fetch stats + history ────────────────────────────────────────────────
   const refresh = useCallback(async () => {
     try {
-      const res = await fetch("/api/queue?limit=50");
-      if (!res.ok) throw new Error(`HTTP ${res.status}`);
-      const data = await res.json();
-      setStats(data.stats);
-      setHistory(data.history ?? []);
+      const [queueRes, historyRes] = await Promise.all([
+        fetch("/api/queue?limit=1"),
+        fetch("/api/history?limit=50"),
+      ]);
+
+      if (!queueRes.ok) throw new Error(`Queue HTTP ${queueRes.status}`);
+      if (!historyRes.ok) throw new Error(`History HTTP ${historyRes.status}`);
+
+      const queueData = await queueRes.json();
+      const historyData = await historyRes.json();
+
+      setStats(queueData.stats);
+      if (historyData?.history?.length > 0) {
+        setHistory(historyData.history);
+      }
+
     } catch (e: unknown) {
       log(`Error al obtener datos: ${e instanceof Error ? e.message : e}`, "err");
     }
   }, [log]);
 
-  // ── Auto-refresh every 3s ────────────────────────────────────────────────
+  // ── SSE — recibe stats+historial del servidor solo cuando cambian ─────────
   useEffect(() => {
+    let es: EventSource;
+
+    function connect() {
+      es = new EventSource("/api/events");
+
+      es.onmessage = (e) => {
+        try {
+          const { stats, history } = JSON.parse(e.data);
+          if (stats && stats.length > 0) setStats(stats);
+          if (history && history.lenght > 0) setHistory(history);
+        } catch { /* ignore malformed */ }
+      };
+
+      es.onerror = () => {
+        es.close();
+        // Reconectar tras 3s si se corta (ej: timeout de Vercel)
+        // setTimeout(connect, 3000);
+      };
+    }
+
+    connect();
+    return () => es?.close();
+  }, []);
+
+  // ── Vaciar cola completa — llama al worker una vez por mensaje ────────────
+  const drainPending = useCallback(async () => {
+    const statsRes = await fetch("/api/queue?limit=1").then(r => r.json()).catch(() => null);
+    const total = statsRes?.stats?.pendiente ?? 0;
+    if (total === 0) { log("No hay mensajes pendientes en la cola", "warn"); return; }
+
+    log(`Vaciando cola: ${total} mensaje(s) pendiente(s)...`, "info");
+    let enviados = 0;
+
+    for (let i = 0; i < total; i++) {
+      try {
+        const wres = await fetch("/api/trigger-worker", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ mode: "once" }),
+        });
+        const wdata = await wres.json();
+        if (wres.ok && wdata.processed > 0) {
+          enviados++;
+          log(`[${enviados}/${total}] Mensaje procesado ✓`, "ok");
+        } else if (wres.ok && wdata.processed === 0) {
+          log("Cola vacía", "warn");
+          break;
+        } else {
+          log(`Error en mensaje ${i + 1}: ${wdata.error}`, "err");
+        }
+      } catch (e) {
+        log(`Fallo de red en mensaje ${i + 1}: ${e instanceof Error ? e.message : e}`, "err");
+      }
+      if (i < total - 1) await new Promise(r => setTimeout(r, 1500));
+      refresh();
+    }
+
+    log(`Listo — ${enviados} de ${total} procesados`, enviados === total ? "ok" : "warn");
     refresh();
-    if (!autoRefresh) return;
-    const id = setInterval(refresh, 3000);
-    return () => clearInterval(id);
-  }, [autoRefresh, refresh]);
+  }, [log, refresh]);
 
   // ── Send message(s) ──────────────────────────────────────────────────────
   async function handleSend() {
@@ -137,6 +203,10 @@ export default function Dashboard() {
 
     log(`Completado: ${ok} encolados, ${fail} fallidos`, ok > 0 ? "ok" : "err");
     if (!bulk) setPhones("");
+
+    // Vaciar toda la cola automáticamente (incluye pendientes previos)
+    if (ok > 0) await drainPending();
+
     setSending(false);
     refresh();
   }
@@ -144,22 +214,22 @@ export default function Dashboard() {
   // ── Trigger worker ───────────────────────────────────────────────────────
   async function handleWorker(mode: "once" | "drain") {
     setWorkerBusy(true);
-    log(`Disparando worker (modo: ${mode})...`, "info");
-    try {
-      const res = await fetch("/api/worker", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ mode, maxMessages: 50 }),
-      });
-      const data = await res.json();
-      if (res.ok) {
-        log(`Worker OK — procesados: ${data.processed}`, "ok");
-      } else {
-        log(`Worker error: ${data.error}`, "err");
+    if (mode === "drain") {
+      await drainPending();
+    } else {
+      try {
+        const res = await fetch("/api/worker", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ mode: "once" }),
+        });
+        const data = await res.json();
+        if (res.ok) log(`Procesado: ${data.processed} mensaje(s)`, "ok");
+        else log(`Worker error: ${data.error}`, "err");
+        refresh();
+      } catch (e: unknown) {
+        log(`Worker fallo de red: ${e instanceof Error ? e.message : e}`, "err");
       }
-      refresh();
-    } catch (e: unknown) {
-      log(`Worker fallo de red: ${e instanceof Error ? e.message : e}`, "err");
     }
     setWorkerBusy(false);
   }
@@ -190,12 +260,7 @@ export default function Dashboard() {
             </div>
           </div>
           <div style={s.headerRight}>
-            <button
-              style={{ ...s.btn, ...(autoRefresh ? s.btnAccent : s.btnGhost) }}
-              onClick={() => setAutoRefresh(v => !v)}
-            >
-              {autoRefresh ? "⟳ Auto ON" : "⟳ Auto OFF"}
-            </button>
+
             <button style={{ ...s.btn, ...s.btnGhost }} onClick={refresh}>Actualizar</button>
           </div>
         </div>
@@ -232,7 +297,7 @@ export default function Dashboard() {
             {(["send", "history", "worker"] as const).map(t => (
               <button
                 key={t}
-                // style={{ ...s.tab, ...(tab === t ? s.tabActive : {}) }}
+                style={{ ...s.tab, ...(tab === t ? s.tabActive : {}) }}
                 onClick={() => setTab(t)}
               >
                 {{ send: "▶ Enviar", history: "☰ Historial", worker: "⚙ Worker" }[t]}
@@ -306,12 +371,11 @@ export default function Dashboard() {
                 onClick={handleSend}
                 disabled={sending}
               >
-                {sending ? "Encolando..." : "▶ Encolar mensaje(s)"}
+                {sending ? "Enviando..." : "▶ Enviar mensaje(s)"}
               </button>
 
               <div style={s.hint}>
-                Los mensajes se guardan en Redis con estado <span style={{ color: "#f59e0b" }}>Pendiente</span>.
-                Usá la pestaña <strong>Worker</strong> para procesarlos.
+                Los mensajes se envían automáticamente al presionar el botón. El worker procesa la cola de forma inmediata.
               </div>
             </div>
           )}
@@ -337,8 +401,8 @@ export default function Dashboard() {
                 <div style={s.empty}>No hay mensajes{filterStatus ? ` con estado "${filterStatus}"` : ""}</div>
               ) : (
                 <div style={s.msgList}>
-                  {filtered.map(msg => (
-                    <MsgCard key={msg.id} msg={msg} />
+                  {filtered.map((msg, index) => (
+                    <MsgCard key={msg.id || index} msg={msg} />
                   ))}
                 </div>
               )}
@@ -411,7 +475,7 @@ export default function Dashboard() {
               <div style={s.logEmpty}>Esperando actividad...</div>
             )}
             {logs.map((entry, i) => (
-              <div key={i} style={{ ...s.logLine, ...s.logColors[entry.type] }}>
+              <div key={i} /* style={{ ...s.logLine, ...s.logColors[entry.type] }} */>
                 <span style={s.logTs}>{fmtTime(entry.ts)}</span>
                 <span>{entry.text}</span>
               </div>
@@ -426,12 +490,13 @@ export default function Dashboard() {
 // ─── Message Card ─────────────────────────────────────────────────────────────
 function MsgCard({ msg }: { msg: Msg }) {
   const meta = STATUS_META[msg.status];
+  if (!meta) return null
   return (
-    <div style={s.msgCard}>
+    <div key={msg.id} style={s.msgCard}>
       <div style={s.msgCardHeader}>
-        <span style={s.msgId}>{msg.id.slice(-12)}</span>
-        <span style={{ ...s.badge, backgroundColor: meta.color + "22", color: meta.color }}>
-          {meta.icon} {meta.label}
+        <span style={s.msgId}>{msg?.id?.slice(-12)}</span>
+        <span style={{ ...s.badge, backgroundColor: meta?.color + "22", color: meta?.color }}>
+          {meta.icon} {meta?.label}
         </span>
       </div>
       <div style={s.msgPhone}>📱 {msg.telefono}</div>
@@ -446,7 +511,7 @@ function MsgCard({ msg }: { msg: Msg }) {
 }
 
 // ─── Styles ───────────────────────────────────────────────────────────────────
-const s: Record<string, React.CSSProperties | Record<string, React.CSSProperties>> = {
+const s: Record<string, React.CSSProperties> = {
   root: { minHeight: "100vh", display: "flex", flexDirection: "column", background: "#0a0c0f" },
 
   header: { borderBottom: "1px solid #1f2430", background: "#0d0f13" },
@@ -469,7 +534,7 @@ const s: Record<string, React.CSSProperties | Record<string, React.CSSProperties
 
   tabs: { display: "flex", gap: 4, marginBottom: 12, borderBottom: "1px solid #1f2430", paddingBottom: 0 },
   tab: { fontFamily: "Syne, sans-serif", fontWeight: 600, fontSize: 13, padding: "10px 18px", background: "transparent", border: "none", borderBottom: "2px solid transparent", color: "#5a6278", cursor: "pointer", transition: "all 0.15s" },
-  tabActive: { color: "#25d366", borderBottomColor: "#25d366" },
+  tabActive: { color: "#25d366" },
 
   panel: { background: "#111318", border: "1px solid #1f2430", borderRadius: 12, padding: 20, display: "flex", flexDirection: "column", gap: 16 },
 
@@ -524,11 +589,11 @@ const s: Record<string, React.CSSProperties | Record<string, React.CSSProperties
   logLine: { display: "flex", gap: 8, padding: "4px 8px", borderRadius: 6, lineHeight: 1.5 },
   logTs: { color: "#5a6278", flexShrink: 0 },
   logColors: {
-    info: { background: "#111318", color: "#8a94ac" },
-    ok: { background: "#0a1f12", color: "#25d366" },
-    err: { background: "#1a0a0a", color: "#f87171" },
-    warn: { background: "#1a1200", color: "#f59e0b" },
-  },
+    info: { background: "#111318", color: "#8a94ac" } as React.CSSProperties,
+    ok: { background: "#0a1f12", color: "#25d366" } as React.CSSProperties,
+    err: { background: "#1a0a0a", color: "#f87171" } as React.CSSProperties,
+    warn: { background: "#1a1200", color: "#f59e0b" } as React.CSSProperties,
+  } as React.CSSProperties,
 
   muted: { color: "#5a6278", fontFamily: "JetBrains Mono, monospace", fontSize: 13 },
 };
